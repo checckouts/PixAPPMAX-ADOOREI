@@ -1092,86 +1092,74 @@
         document.getElementById('btn-generate').addEventListener('click', generatePix);
 
         async function generatePix() {
-            const name = document.getElementById('name').value;
-            const cpf = document.getElementById('cpf').value;
-            const phone = document.getElementById('phone').value;
-            const errorEl = document.getElementById('error-msg');
-            const errorText = document.getElementById('error-text');
+    const name = document.getElementById('name').value;
+    const cpf = document.getElementById('cpf').value;
+    const phone = document.getElementById('phone').value;
+    const errorEl = document.getElementById('error-msg');
+    const errorText = document.getElementById('error-text');
 
-            if (!name || cpf.length < 14 || phone.length < 14) {
-                errorText.textContent = 'Preencha todos os campos corretamente.';
-                errorEl.classList.add('visible');
-                return;
-            }
+    if (!name || cpf.length < 14 || phone.length < 14) {
+        errorText.textContent = 'Preencha todos os campos corretamente.';
+        errorEl.classList.add('visible');
+        return;
+    }
 
-            const loadingModal = document.getElementById('loading-modal');
-            const loadingProgress = document.getElementById('loading-progress');
-            const loadingStatus = document.getElementById('loading-status');
+    const loadingModal = document.getElementById('loading-modal');
+    const loadingProgress = document.getElementById('loading-progress');
+    const loadingStatus = document.getElementById('loading-status');
+    const btnGenerate = document.getElementById('btn-generate');
 
-            // Desabilitar botão durante processamento
-            const btnGenerate = document.getElementById('btn-generate');
-            btnGenerate.disabled = true;
-            btnGenerate.innerHTML = '<div class="loading-wrapper"><div class="spinner"></div><span class="loading-text-step">Processando...</span></div>';
+    // Estado inicial de loading
+    btnGenerate.disabled = true;
+    btnGenerate.innerHTML = '<div class="loading-wrapper"><div class="spinner"></div><span class="loading-text-step">Processando...</span></div>';
+    loadingProgress.style.width = '30%';
+    loadingStatus.textContent = 'Conectando ao banco...';
+    loadingModal.classList.add('active');
+    errorEl.classList.remove('visible');
 
-            // Resetar progresso
-            loadingProgress.style.width = '0%';
-            loadingStatus.textContent = 'Iniciando...';
-            loadingModal.classList.add('active');
-            errorEl.classList.remove('visible');
+    try {
+        // Captura o subtotal
+        const pixUrlParams = new URLSearchParams(window.location.search);
+        const subtotal = pixUrlParams.get('subtotal') || null;
 
-            const steps = [
-                { text: 'Validando dados...', progress: 50 },
-                { text: 'Processando pagamento...', progress: 55 },
-                { text: 'Gerando Codigo PIX...', progress: 60 },
-                { text: 'Aguarde um Momento...', progress: 90 }
-            ];
+        // Inicia a requisição IMEDIATAMENTE (sem delays artificiais)
+        loadingProgress.style.width = '60%';
+        loadingStatus.textContent = 'Gerando PIX, aguarde...';
 
-            try {
-                // Animar os primeiros passos
-                for (const step of steps) {
-                    loadingStatus.textContent = step.text;
-                    loadingProgress.style.width = `${step.progress}%`;
-                    await new Promise(r => setTimeout(r, 800));
-                }
+        const response = await fetch('/proxy/pix', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                payer_name: name,
+                payer_cpf: cpf,
+                payer_phone: phone,
+                subtotal: subtotal
+            })
+        });
 
-                // Captura o subtotal da URL para enviar ao backend
-                const pixUrlParams = new URLSearchParams(window.location.search);
-                const subtotal = pixUrlParams.get('subtotal') || null;
+        const data = await response.json();
 
-                const response = await fetch('/proxy/pix', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        payer_name: name,
-                        payer_cpf: cpf,
-                        payer_phone: phone,
-                        subtotal: subtotal
-                    })
-                });
-
-                const data = await response.json();
-
-                if (data.success && data.pixUrl) {
-                    // Completar a barra e redirecionar
-                    loadingProgress.style.width = '100%';
-                    loadingStatus.textContent = 'Aguarde...';
-                    await new Promise(r => setTimeout(r, 600));
-                    window.location.href = data.pixUrl;
-                } else {
-                    loadingModal.classList.remove('active');
-                    btnGenerate.disabled = false;
-                    btnGenerate.innerHTML = '<span class="btn-text">PAGAR PIX AGORA</span>';
-                    errorText.textContent = data.error || 'Erro ao gerar PIX. Tente novamente.';
-                    errorEl.classList.add('visible');
-                }
-            } catch (err) {
-                loadingModal.classList.remove('active');
-                btnGenerate.disabled = false;
-                btnGenerate.innerHTML = '<span class="btn-text">GERAR PIX AGORA</span>';
-                errorText.textContent = 'Erro de conexão. Tente novamente.';
-                errorEl.classList.add('visible');
-            }
+        if (data.success && data.pixUrl) {
+            // Sucesso! Redireciona imediatamente.
+            loadingProgress.style.width = '100%';
+            loadingStatus.textContent = 'Preparando...';
+            window.location.href = data.pixUrl;
+        } else {
+            // Tratamento de erro
+            loadingModal.classList.remove('active');
+            btnGenerate.disabled = false;
+            btnGenerate.innerHTML = '<span class="btn-text">GERAR PIX AGORA</span>';
+            errorText.textContent = data.error || 'Erro ao gerar PIX. Tente novamente.';
+            errorEl.classList.add('visible');
         }
+    } catch (err) {
+        loadingModal.classList.remove('active');
+        btnGenerate.disabled = false;
+        btnGenerate.innerHTML = '<span class="btn-text">GERAR PIX AGORA</span>';
+        errorText.textContent = 'Erro de conexão. Tente novamente.';
+        errorEl.classList.add('visible');
+    }
+}
 
         // ==================== MODAL ENTREGA ====================
         function showDeliveryModal() {
