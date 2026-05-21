@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
-from typing import Optional
+from typing import Optional, Dict
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,11 +39,13 @@ SUBTOTAL_LINKS = {
     # Adicione quantos precisar...
 }
 
-
 # Link padrão caso o subtotal não seja encontrado no mapeamento
 EXTERNAL_CHECKOUT_URL_DEFAULT = "https://pay.meuservicomei.com.br/r/9D5r68181N8jQVa5Z4"
 
 EXTERNAL_BASE_URL = "https://pay.meuservicomei.com.br"
+
+# Tempo máximo (em segundos) que uma página pré-aquecida pode ficar no cache antes de ser descartada
+PAGE_MAX_AGE_SECONDS = 120
 
 
 def get_checkout_url_by_subtotal(subtotal: Optional[str]) -> str:
@@ -68,21 +70,43 @@ class PixRequest(BaseModel):
     subtotal: str = None  # Subtotal para determinar o link de checkout
 
 
+class PreWarmedPage:
+    """Armazena uma página pré-aquecida com timestamp de criação."""
+    def __init__(self, page, created_at: float):
+        self.page = page
+        self.created_at = created_at
+
+    def is_expired(self) -> bool:
+        import time
+        return (time.time() - self.created_at) > PAGE_MAX_AGE_SECONDS
+
+    def is_valid(self) -> bool:
+        return not self.page.is_closed() and not self.is_expired()
+
+
 class BrowserManager:
     """
     Gerencia o Playwright com pool de páginas pré-aquecidas.
     Usa UM ÚNICO contexto para evitar crash do Chromium em ambientes limitados.
     Inclui auto-restart caso o browser caia.
+    
+    OTIMIZAÇÃO PRINCIPAL: Mantém páginas já carregadas com tokens prontos
+    para uso imediato quando o usuário solicitar a geração do PIX.
     """
 
-    def __init__(self, pool_size=2):
+    def __init__(self, pool_size=3):
         self.playwright = None
         self.browser = None
         self.context = None
         self.pool_size = pool_size
-        self.page_queue: asyncio.Queue = asyncio.Queue(maxsize=pool_size)
         self._running = False
         self._starting = False
+        self._lock = asyncio.Lock()
+
+        # Pool de páginas pré-aquecidas: {checkout_url: [PreWarmedPage, ...]}
+        self._warm_pages: Dict[str, list] = {}
+        # Task de manutenção do pool
+        self._maintenance_task = None
 
     async def start(self):
         """Inicia o Playwright e o browser."""
@@ -105,6 +129,9 @@ class BrowserManager:
                     '--disable-translate',
                     '--metrics-recording-only',
                     '--no-first-run',
+                    '--single-process',
+                    '--disable-background-timer-throttling',
+                    '--disable-renderer-backgrounding',
                 ]
             )
             self.context = await self.browser.new_context(
@@ -112,14 +139,105 @@ class BrowserManager:
             )
             self._running = True
             logger.info("BrowserManager iniciado com sucesso")
+
+            # Inicia o pré-aquecimento em background
+            self._maintenance_task = asyncio.create_task(self._pool_maintenance_loop())
+
+            # Pré-aquece as páginas dos subtotais mais comuns
+            asyncio.create_task(self._initial_warmup())
+
         except Exception as e:
             logger.error(f"Erro ao iniciar BrowserManager: {e}")
         finally:
             self._starting = False
 
+    async def _initial_warmup(self):
+        """Pré-aquece páginas para os links mais usados no startup."""
+        await asyncio.sleep(1)  # Espera o browser estabilizar
+
+        # Pré-aquece o link padrão (mais usado)
+        await self._add_warm_page(EXTERNAL_CHECKOUT_URL_DEFAULT)
+        logger.info("Pré-aquecimento inicial concluído (link padrão)")
+
+        # Pré-aquece os demais links em background (sem bloquear)
+        for subtotal, url in SUBTOTAL_LINKS.items():
+            if url != EXTERNAL_CHECKOUT_URL_DEFAULT:
+                await self._add_warm_page(url)
+                await asyncio.sleep(0.5)  # Espaça para não sobrecarregar
+        
+        logger.info(f"Pré-aquecimento completo: {len(self._warm_pages)} URLs prontas")
+
+    async def _pool_maintenance_loop(self):
+        """Loop de manutenção que remove páginas expiradas e repõe o pool."""
+        while self._running:
+            try:
+                await asyncio.sleep(30)  # Verifica a cada 30 segundos
+                await self._cleanup_expired_pages()
+                await self._replenish_pool()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Erro na manutenção do pool: {e}")
+                await asyncio.sleep(5)
+
+    async def _cleanup_expired_pages(self):
+        """Remove páginas expiradas ou fechadas do pool."""
+        for url in list(self._warm_pages.keys()):
+            valid_pages = []
+            for wp in self._warm_pages[url]:
+                if wp.is_valid():
+                    valid_pages.append(wp)
+                else:
+                    try:
+                        if not wp.page.is_closed():
+                            await wp.page.close()
+                    except:
+                        pass
+                    logger.info(f"Página expirada removida para: {url}")
+            self._warm_pages[url] = valid_pages
+
+    async def _replenish_pool(self):
+        """Garante que sempre haja pelo menos 1 página pronta para o link padrão."""
+        default_url = EXTERNAL_CHECKOUT_URL_DEFAULT
+        valid_count = sum(1 for wp in self._warm_pages.get(default_url, []) if wp.is_valid())
+
+        if valid_count < 1:
+            logger.info("Repondo página padrão no pool...")
+            await self._add_warm_page(default_url)
+
+    async def _add_warm_page(self, checkout_url: str):
+        """Cria uma página pré-aquecida e adiciona ao pool."""
+        try:
+            page = await self._create_ready_page(checkout_url)
+            if page:
+                import time
+                wp = PreWarmedPage(page, time.time())
+                if checkout_url not in self._warm_pages:
+                    self._warm_pages[checkout_url] = []
+                self._warm_pages[checkout_url].append(wp)
+                logger.info(f"Página pré-aquecida adicionada para: {checkout_url}")
+        except Exception as e:
+            logger.error(f"Erro ao pré-aquecer página para {checkout_url}: {e}")
+
     async def _restart(self):
         """Reinicia o browser caso ele tenha crashado."""
         logger.warning("Reiniciando browser...")
+        self._running = False
+
+        # Cancela a task de manutenção
+        if self._maintenance_task:
+            self._maintenance_task.cancel()
+
+        # Limpa o pool
+        for url, pages in self._warm_pages.items():
+            for wp in pages:
+                try:
+                    if not wp.page.is_closed():
+                        await wp.page.close()
+                except:
+                    pass
+        self._warm_pages.clear()
+
         try:
             if self.context:
                 await self.context.close()
@@ -142,42 +260,100 @@ class BrowserManager:
 
         await self.start()
 
-    async def create_ready_page(self, checkout_url: str):
+    async def _create_ready_page(self, checkout_url: str):
         """Cria uma nova página já navegada para o checkout específico."""
         if not self.context:
             raise Exception("Contexto não disponível")
 
         page = await self.context.new_page()
 
-        # Bloqueia recursos pesados
+        # Bloqueia recursos pesados de forma agressiva
         async def block_resources(route):
-            if route.request.resource_type in ["image", "font", "media"]:
+            resource_type = route.request.resource_type
+            # Bloqueia tudo que não é essencial para obter o CSRF e cart_token
+            if resource_type in ["image", "font", "media", "stylesheet"]:
                 return await route.abort()
             url = route.request.url.lower()
-            if any(d in url for d in ["facebook", "google-analytics", "hotjar", "clarity", "tiktok", "doubleclick", "gtag"]):
+            blocked_domains = [
+                "facebook", "google-analytics", "hotjar", "clarity",
+                "tiktok", "doubleclick", "gtag", "googletagmanager",
+                "pixel", "analytics", "tracking", "adservice",
+                "cdn.jsdelivr", "fonts.googleapis", "fonts.gstatic"
+            ]
+            if any(d in url for d in blocked_domains):
                 return await route.abort()
             await route.continue_()
 
         await page.route("**/*", block_resources)
 
         # Navega para o checkout específico
-        await page.goto(checkout_url, wait_until='domcontentloaded', timeout=25000)
+        await page.goto(checkout_url, wait_until='domcontentloaded', timeout=20000)
 
-        # Aguarda variáveis essenciais
+        # Aguarda variáveis essenciais com timeout reduzido
         try:
             await page.wait_for_function(
                 "window.ck && window.ck.data && window.ck.data.cart_token && document.querySelector('input[name=\"_token\"]')",
-                timeout=15000
+                timeout=12000
             )
             logger.info("Página carregada - CSRF e cart_token disponíveis")
         except Exception as e:
             logger.warning(f"Timeout aguardando variáveis: {e}")
-            await asyncio.sleep(2)
+            # Tenta esperar um pouco mais, mas sem bloquear demais
+            await asyncio.sleep(1)
+
+        return page
+
+    async def get_ready_page(self, checkout_url: str):
+        """
+        MÉTODO PRINCIPAL: Retorna uma página pronta para uso.
+        1. Tenta pegar do pool (instantâneo).
+        2. Se não houver, cria uma nova (mais lento, mas funciona).
+        3. Dispara reposição em background para o próximo usuário.
+        """
+        async with self._lock:
+            # Tenta pegar uma página válida do pool
+            if checkout_url in self._warm_pages:
+                while self._warm_pages[checkout_url]:
+                    wp = self._warm_pages[checkout_url].pop(0)
+                    if wp.is_valid():
+                        logger.info(f"Página pré-aquecida disponível para: {checkout_url}")
+                        # Repõe em background para o próximo usuário
+                        asyncio.create_task(self._add_warm_page(checkout_url))
+                        return wp.page
+                    else:
+                        # Página expirada, fecha e tenta a próxima
+                        try:
+                            if not wp.page.is_closed():
+                                await wp.page.close()
+                        except:
+                            pass
+
+        # Se não encontrou no pool, cria uma nova (fallback)
+        logger.info(f"Nenhuma página no pool para {checkout_url}, criando nova...")
+        page = await self._create_ready_page(checkout_url)
+
+        # Repõe em background
+        asyncio.create_task(self._add_warm_page(checkout_url))
 
         return page
 
     async def close(self):
+        """Encerra o browser e limpa todos os recursos."""
         self._running = False
+
+        if self._maintenance_task:
+            self._maintenance_task.cancel()
+
+        # Fecha todas as páginas do pool
+        for url, pages in self._warm_pages.items():
+            for wp in pages:
+                try:
+                    if not wp.page.is_closed():
+                        await wp.page.close()
+                except:
+                    pass
+        self._warm_pages.clear()
+
         if self.context:
             try:
                 await self.context.close()
@@ -195,7 +371,7 @@ class BrowserManager:
                 pass
 
 
-browser_manager = BrowserManager(pool_size=2)
+browser_manager = BrowserManager(pool_size=3)
 
 
 @app.on_event("startup")
@@ -210,8 +386,8 @@ async def shutdown_event():
 
 async def automate_pix_generation(data: PixRequest):
     """
-    Gera PIX usando abordagem híbrida:
-    - Playwright para contornar Cloudflare
+    Gera PIX usando abordagem híbrida otimizada:
+    - Usa página pré-aquecida do pool (instantâneo quando disponível)
     - fetch() direto no JS para máxima velocidade
     - Fallback para realizarPagamento se necessário
     """
@@ -226,14 +402,19 @@ async def automate_pix_generation(data: PixRequest):
     cpf_clean = ''.join(c for c in data.payer_cpf if c.isdigit())
     phone_clean = '11999999999'  # Telefone padrão fixo para todas as operações
 
-    # Cria página diretamente com o checkout_url correto
+    # Obtém página pronta do pool (ou cria uma nova se necessário)
+    page = None
     try:
-        page = await browser_manager.create_ready_page(checkout_url)
+        page = await browser_manager.get_ready_page(checkout_url)
     except Exception as e:
-        logger.error(f"Falha ao criar página: {e}")
-        await browser_manager._restart()
-        await asyncio.sleep(2)
-        page = await browser_manager.create_ready_page(checkout_url)
+        logger.error(f"Falha ao obter página: {e}")
+        try:
+            await browser_manager._restart()
+            await asyncio.sleep(2)
+            page = await browser_manager.get_ready_page(checkout_url)
+        except Exception as e2:
+            logger.error(f"Falha após restart: {e2}")
+            return None, str(e2)
 
     try:
         # ===== MÉTODO 1: Fetch direto (mais rápido) =====
@@ -346,8 +527,8 @@ async def automate_pix_generation(data: PixRequest):
 
         # Recarrega para estado limpo usando o checkout_url correto
         try:
-            await page.goto(checkout_url, wait_until='domcontentloaded', timeout=20000)
-            await page.wait_for_function("window.form && typeof realizarPagamento === 'function'", timeout=10000)
+            await page.goto(checkout_url, wait_until='domcontentloaded', timeout=15000)
+            await page.wait_for_function("window.form && typeof realizarPagamento === 'function'", timeout=8000)
         except Exception as e:
             logger.warning(f"Erro no reload do fallback: {e}")
 
@@ -381,7 +562,7 @@ async def automate_pix_generation(data: PixRequest):
             return None, str(e)
 
         try:
-            await asyncio.wait_for(response_received.wait(), timeout=10.0)
+            await asyncio.wait_for(response_received.wait(), timeout=8.0)
         except asyncio.TimeoutError:
             current_url = page.url
             if any(kw in current_url for kw in ['obrigado', 'sucesso', 'pix']):
@@ -418,7 +599,17 @@ async def proxy_pix(request: PixRequest):
 
 @app.get('/health')
 async def health():
-    return {"status": "ok"}
+    """Health check com informações do pool."""
+    pool_info = {}
+    for url, pages in browser_manager._warm_pages.items():
+        valid = sum(1 for wp in pages if wp.is_valid())
+        pool_info[url] = valid
+
+    return {
+        "status": "ok",
+        "browser_running": browser_manager._running,
+        "warm_pages": pool_info
+    }
 
 
 @app.get('/')
