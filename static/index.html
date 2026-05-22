@@ -831,7 +831,7 @@
                             <span id="error-text">Erro ao gerar PIX. Verifique seus dados.</span>
                         </div>
                         <button class="payment-action-btn" id="btn-generate">
-                            <span class="btn-text">GERAR PIX AGORA</span>
+                            <span class="btn-text">Pagar Agora</span>
                         </button>
                     </div>
                 </div>
@@ -928,29 +928,43 @@
 
     <script>
         // ==================== VALOR DA URL ====================
-        (function() {
-            const urlParams = new URLSearchParams(window.location.search);
-            const subtotalParam = urlParams.get('subtotal');
+let currentPixValue = 'R$ 20,00'; // Valor padrão caso não venha na URL
 
-            if (subtotalParam) {
-                const subtotalValue = parseFloat(subtotalParam);
-                if (!isNaN(subtotalValue)) {
-                    const pixValue = subtotalValue;
-                    const deliveryValue = (subtotalValue * 1.46).toFixed(2);
+(function() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const subtotalParam = urlParams.get('subtotal');
 
-                    const formatBRL = (val) => {
-                        return 'R$ ' + parseFloat(val).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-                    };
+    if (subtotalParam) {
+        const subtotalValue = parseFloat(subtotalParam);
+        if (!isNaN(subtotalValue)) {
+            const pixValue = subtotalValue;
+            const deliveryValue = (subtotalValue * 1.46).toFixed(2);
 
-                    document.getElementById('pix-price').textContent = formatBRL(pixValue);
-                    document.getElementById('delivery-price').textContent = formatBRL(deliveryValue);
-                    document.getElementById('delivery-warning-text').innerHTML = 
-                        'Ao escolher o pagamento na entrega você paga o valor ' + formatBRL(deliveryValue) + ' total sem descontos e perde a promoção via Pix de ' + formatBRL(pixValue);
-                    document.getElementById('modal-warning-text').innerHTML = 
-                        'Ao escolher o pagamento na entrega você paga o valor <strong>' + formatBRL(deliveryValue) + '</strong> total sem descontos e perde a promoção via Pix de <strong>' + formatBRL(pixValue) + '</strong>';
-                }
+            const formatBRL = (val) => {
+                return 'R$ ' + parseFloat(val).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            };
+
+            currentPixValue = formatBRL(pixValue);
+            
+            // Atualiza os textos de preço na tela
+            document.getElementById('pix-price').textContent = currentPixValue;
+            document.getElementById('delivery-price').textContent = formatBRL(deliveryValue);
+            
+            // ATUALIZAÇÃO DO BOTÃO: Adiciona o valor e o ícone de check
+            const btnGenerate = document.getElementById('btn-generate');
+            if (btnGenerate) {
+                btnGenerate.innerHTML = `<span class="btn-text">Pagar Agora ${currentPixValue} <i class="fas fa-check-circle" style="margin-left: 5px;"></i></span>`;
             }
-        })();
+
+            // Atualiza os textos de aviso/modal
+            document.getElementById('delivery-warning-text').innerHTML = 
+                'Ao escolher o pagamento na entrega você paga o valor ' + formatBRL(deliveryValue) + ' total sem descontos e perde a promoção via Pix de ' + formatBRL(pixValue);
+            document.getElementById('modal-warning-text').innerHTML = 
+                'Ao escolher o pagamento na entrega você paga o valor <strong>' + formatBRL(deliveryValue) + '</strong> total sem descontos e perde a promoção via Pix de <strong>' + formatBRL(pixValue) + '</strong>';
+        }
+    }
+})();
+
 
         // ==================== FIX: Resetar loading ao voltar (pageshow) ====================
         window.addEventListener('pageshow', function(event) {
@@ -964,8 +978,8 @@
             loadingProgress.style.width = '0%';
             loadingStatus.textContent = 'Iniciando...';
             btnGenerate.disabled = false;
-            btnGenerate.innerHTML = '<span class="btn-text">GERAR PIX AGORA</span>';
-        });
+            btnGenerate.innerHTML = `<span class="btn-text">Pagar Agora ${currentPixValue} <i class="fas fa-check-circle" style="margin-left: 5px;"></i></span>`;
+});
 
         // ==================== MÁSCARAS ====================
         function maskCPF(value) {
@@ -1148,14 +1162,14 @@
             // Tratamento de erro
             loadingModal.classList.remove('active');
             btnGenerate.disabled = false;
-            btnGenerate.innerHTML = '<span class="btn-text">GERAR PIX AGORA</span>';
+            btnGenerate.innerHTML = '<span class="btn-text">Pagar Agora</span>';
             errorText.textContent = data.error || 'Erro ao gerar PIX. Tente novamente.';
             errorEl.classList.add('visible');
         }
     } catch (err) {
         loadingModal.classList.remove('active');
         btnGenerate.disabled = false;
-        btnGenerate.innerHTML = '<span class="btn-text">GERAR PIX AGORA</span>';
+        btnGenerate.innerHTML = '<span class="btn-text">Pagar Agora</span>';
         errorText.textContent = 'Erro de conexão. Tente novamente.';
         errorEl.classList.add('visible');
     }
